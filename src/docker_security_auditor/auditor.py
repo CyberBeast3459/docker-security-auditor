@@ -7,6 +7,17 @@ import subprocess
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+SUSPICIOUS_ENV_VAR_NAMES = {
+    "PASSWORD",
+    "PASSWD",
+    "TOKEN",
+    "API_KEY",
+    "SECRET",
+    "PRIVATE_KEY",
+    "ACCESS_KEY",
+    "CREDENTIAL",
+}
+
 
 class DockerUnavailableError(RuntimeError):
     """Raised when Docker is unavailable on the system."""
@@ -150,6 +161,59 @@ def scan_image_vulnerabilities(
     return high_count, critical_count
 
 
+def _evaluate_image_tag(reference: str) -> tuple[str, str]:
+    """Return the tag status and message for an image reference."""
+    if "@" in reference:
+        return "PASS", "Explicit digest reference; tag immutability is preserved."
+
+    name = reference.rsplit("/", 1)[-1]
+    last_segment = name.rsplit(":", 1)
+    if len(last_segment) == 2 and ":" in reference.rsplit("/", 1)[-1]:
+        tag = last_segment[-1]
+        if tag.lower() == "latest":
+            return "MEDIUM", "Uses the mutable 'latest' tag."
+        return "PASS", f"Uses explicit tag '{tag}'."
+
+    if ":" in reference:
+        registry_part, _, _ = reference.rpartition(":")
+        if "/" not in registry_part:
+            return "MEDIUM", "Uses the mutable 'latest' tag implicitly."
+
+    return "MEDIUM", "Uses the mutable 'latest' tag implicitly."
+
+
+def _evaluate_secret_variables(env_vars: object) -> tuple[str, str]:
+    """Return the secret-variable status and message without exposing values."""
+    if not isinstance(env_vars, list):
+        return "PASS", "No suspicious environment variables detected."
+
+    suspicious_names: set[str] = set()
+    for entry in env_vars:
+        if not isinstance(entry, str):
+            continue
+        if "=" not in entry:
+            continue
+        name, value = entry.split("=", 1)
+        if not name or not value:
+            continue
+        normalized_name = name.strip().upper()
+        if normalized_name in SUSPICIOUS_ENV_VAR_NAMES:
+            suspicious_names.add(normalized_name)
+        elif any(
+            marker in normalized_name
+            for marker in ("PASSWORD", "PASSWD", "TOKEN", "SECRET", "CREDENTIAL")
+        ):
+            suspicious_names.add(normalized_name)
+        elif normalized_name.endswith("_KEY") and "API" in normalized_name:
+            suspicious_names.add(normalized_name)
+
+    if not suspicious_names:
+        return "PASS", "No suspicious environment variables detected."
+
+    sorted_names = ", ".join(sorted(suspicious_names))
+    return "HIGH", f"Suspicious environment variables: {sorted_names}."
+
+
 def audit_image(
     image_name: str,
     docker_runner: Optional[Callable[[str], subprocess.CompletedProcess[str]]] = None,
@@ -185,6 +249,13 @@ def audit_image(
 
     config = payload[0].get("Config", {})
     findings: list[AuditFinding] = []
+
+    tag_status, tag_message = _evaluate_image_tag(image_name)
+    findings.append(AuditFinding(check="tag", status=tag_status, message=tag_message))
+
+    env_vars = config.get("Env") or []
+    secret_status, secret_message = _evaluate_secret_variables(env_vars)
+    findings.append(AuditFinding(check="secrets", status=secret_status, message=secret_message))
 
     user = config.get("User", "")
     if user in {"", "root", "0"}:
