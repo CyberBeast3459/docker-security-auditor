@@ -18,10 +18,27 @@ python -m docker_security_auditor --version
 python -m docker_security_auditor audit alpine
 ```
 
-### Example audit output
+### Audit checks
 
-- `HIGH: Configured user is 'root' (root-equivalent).`
-- `PASS: Configured user is 'app'.`
+The `audit` command inspects a local Docker image and reports:
+
+- the configured user (high risk for root-equivalent users)
+- declared exposed ports
+- whether the image has a health check configured
+
+### Example output
+
+High-risk root image:
+
+```text
+HIGH: user: Configured user is 'root' (root-equivalent). | ports: No exposed ports are declared. | healthcheck: No health check is configured.
+```
+
+Medium-risk non-root image missing a health check:
+
+```text
+MEDIUM: user: Configured user is 'app'. | ports: Exposed ports: 80/tcp. | healthcheck: No health check is configured.
+```
 
 ## Next steps
 

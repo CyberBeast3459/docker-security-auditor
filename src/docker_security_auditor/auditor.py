@@ -17,11 +17,35 @@ class ImageNotFoundError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class AuditFinding:
+    """Represents a single audit finding."""
+
+    check: str
+    status: str
+    message: str
+
+
+@dataclass(frozen=True)
 class AuditResult:
     """Represents the outcome of auditing an image."""
 
-    status: str
-    message: str
+    findings: tuple[AuditFinding, ...]
+
+    @property
+    def status(self) -> str:
+        """Return the highest-severity status across the findings."""
+        if any(finding.status == "HIGH" for finding in self.findings):
+            return "HIGH"
+        if any(finding.status == "MEDIUM" for finding in self.findings):
+            return "MEDIUM"
+        if any(finding.status == "INFO" for finding in self.findings):
+            return "INFO"
+        return "PASS"
+
+    @property
+    def message(self) -> str:
+        """Return a single summary line for the result."""
+        return " | ".join(f"{finding.check}: {finding.message}" for finding in self.findings)
 
 
 def _default_docker_runner(image_name: str) -> subprocess.CompletedProcess[str]:
@@ -38,7 +62,7 @@ def audit_image(
     image_name: str,
     docker_runner: Optional[Callable[[str], subprocess.CompletedProcess[str]]] = None,
 ) -> AuditResult:
-    """Inspect a local Docker image and report whether its configured user is root."""
+    """Inspect a local Docker image and report multiple configuration checks."""
     runner = docker_runner or _default_docker_runner
 
     try:
@@ -66,9 +90,53 @@ def audit_image(
         raise RuntimeError("Docker inspect did not return any image metadata.")
 
     config = payload[0].get("Config", {})
+    findings: list[AuditFinding] = []
+
     user = config.get("User", "")
-
     if user in {"", "root", "0"}:
-        return AuditResult(status="HIGH", message=f"Configured user is '{user or 'empty'}' (root-equivalent).")
+        findings.append(
+            AuditFinding(
+                check="user",
+                status="HIGH",
+                message=f"Configured user is '{user or 'empty'}' (root-equivalent).",
+            )
+        )
+    else:
+        findings.append(AuditFinding(check="user", status="PASS", message=f"Configured user is '{user}'."))
 
-    return AuditResult(status="PASS", message=f"Configured user is '{user}'.")
+    exposed_ports = config.get("ExposedPorts") or {}
+    if exposed_ports:
+        ports = sorted(exposed_ports.keys())
+        findings.append(AuditFinding(check="ports", status="INFO", message=f"Exposed ports: {', '.join(ports)}."))
+    else:
+        findings.append(AuditFinding(check="ports", status="INFO", message="No exposed ports are declared."))
+
+    healthcheck = config.get("Healthcheck") or {}
+    if isinstance(healthcheck, dict) and healthcheck.get("Test"):
+        test_value = healthcheck.get("Test")
+        if isinstance(test_value, list) and test_value == ["NONE"]:
+            findings.append(
+                AuditFinding(
+                    check="healthcheck",
+                    status="MEDIUM",
+                    message="Health check is explicitly disabled with ['NONE'].",
+                )
+            )
+        else:
+            findings.append(
+                AuditFinding(
+                    check="healthcheck",
+                    status="PASS",
+                    message="A health check is configured.",
+                )
+            )
+    else:
+        findings.append(
+            AuditFinding(
+                check="healthcheck",
+                status="MEDIUM",
+                message="No health check is configured.",
+            )
+        )
+
+    return AuditResult(findings=tuple(findings))
