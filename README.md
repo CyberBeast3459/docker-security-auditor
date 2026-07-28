@@ -15,10 +15,16 @@ Run the CLI with:
 ```bash
 python -m docker_security_auditor --help
 python -m docker_security_auditor --version
+python -m docker_security_auditor audit alpine
 ```
+
+### Example audit output
+
+- `HIGH: Configured user is 'root' (root-equivalent).`
+- `PASS: Configured user is 'app'.`
 
 ## Next steps
 
-- Add image inspection logic
+- Add more security checks for image contents and package vulnerabilities
 - Integrate Trivy to enrich vulnerability results
 - Expand CLI commands and output formats
