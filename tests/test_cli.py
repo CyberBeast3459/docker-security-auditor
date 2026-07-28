@@ -81,7 +81,7 @@ def test_audit_image_reports_pass_for_non_root_user() -> None:
 def test_audit_image_reports_exposed_ports_and_healthcheck() -> None:
     runner = Mock(
         return_value=subprocess.CompletedProcess(
-            args=["docker", "image", "inspect", "alpine"],
+            args=["docker", "image", "inspect", "alpine:3.19"],
             returncode=0,
             stdout='[{"Config": {"User": "app", "ExposedPorts": {"80/tcp": {}}, "Healthcheck": {"Test": ["CMD", "echo", "ok"]}}}]',
             stderr="",
@@ -90,14 +90,14 @@ def test_audit_image_reports_exposed_ports_and_healthcheck() -> None:
 
     trivy_runner = Mock(
         return_value=subprocess.CompletedProcess(
-            args=["trivy", "image", "--scanners", "vuln", "alpine"],
+            args=["trivy", "image", "--scanners", "vuln", "alpine:3.19"],
             returncode=0,
             stdout='{"Results": []}',
             stderr="",
         )
     )
 
-    result = audit_image("alpine", docker_runner=runner, trivy_runner=trivy_runner)
+    result = audit_image("alpine:3.19", docker_runner=runner, trivy_runner=trivy_runner)
 
     assert result.status == "INFO"
     assert any(finding.check == "ports" and "80/tcp" in finding.message for finding in result.findings)
@@ -284,6 +284,146 @@ def test_audit_image_raises_for_trivy_scan_failure() -> None:
 
     with pytest.raises(TrivyScanError):
         audit_image("alpine", docker_runner=docker_runner, trivy_runner=trivy_runner)
+
+
+def test_audit_image_marks_latest_tag_as_medium() -> None:
+    docker_runner = Mock(
+        return_value=subprocess.CompletedProcess(
+            args=["docker", "image", "inspect", "alpine:latest"],
+            returncode=0,
+            stdout='[{"Config": {"User": "app"}}]',
+            stderr="",
+        )
+    )
+    trivy_runner = Mock(
+        return_value=subprocess.CompletedProcess(
+            args=["trivy", "image", "--scanners", "vuln", "alpine:latest"],
+            returncode=0,
+            stdout='{"Results": []}',
+            stderr="",
+        )
+    )
+
+    result = audit_image("alpine:latest", docker_runner=docker_runner, trivy_runner=trivy_runner)
+
+    tag_finding = next(finding for finding in result.findings if finding.check == "tag")
+    assert tag_finding.status == "MEDIUM"
+    assert "latest" in tag_finding.message
+
+
+def test_audit_image_treats_implicit_latest_as_medium() -> None:
+    docker_runner = Mock(
+        return_value=subprocess.CompletedProcess(
+            args=["docker", "image", "inspect", "alpine"],
+            returncode=0,
+            stdout='[{"Config": {"User": "app"}}]',
+            stderr="",
+        )
+    )
+    trivy_runner = Mock(
+        return_value=subprocess.CompletedProcess(
+            args=["trivy", "image", "--scanners", "vuln", "alpine"],
+            returncode=0,
+            stdout='{"Results": []}',
+            stderr="",
+        )
+    )
+
+    result = audit_image("alpine", docker_runner=docker_runner, trivy_runner=trivy_runner)
+
+    tag_finding = next(finding for finding in result.findings if finding.check == "tag")
+    assert tag_finding.status == "MEDIUM"
+    assert "implicitly" in tag_finding.message.lower()
+
+
+def test_audit_image_handles_registry_port_and_digest_references() -> None:
+    docker_runner = Mock(
+        return_value=subprocess.CompletedProcess(
+            args=["docker", "image", "inspect", "registry.example.com:5000/app:1.2.3"],
+            returncode=0,
+            stdout='[{"Config": {"User": "app"}}]',
+            stderr="",
+        )
+    )
+    trivy_runner = Mock(
+        return_value=subprocess.CompletedProcess(
+            args=["trivy", "image", "--scanners", "vuln", "registry.example.com:5000/app:1.2.3"],
+            returncode=0,
+            stdout='{"Results": []}',
+            stderr="",
+        )
+    )
+
+    result = audit_image("registry.example.com:5000/app:1.2.3", docker_runner=docker_runner, trivy_runner=trivy_runner)
+
+    tag_finding = next(finding for finding in result.findings if finding.check == "tag")
+    assert tag_finding.status == "PASS"
+    assert "1.2.3" in tag_finding.message
+
+    digest_result = audit_image(
+        "registry.example.com:5000/app@sha256:deadbeef",
+        docker_runner=docker_runner,
+        trivy_runner=trivy_runner,
+    )
+    digest_finding = next(finding for finding in digest_result.findings if finding.check == "tag")
+    assert digest_finding.status == "PASS"
+    assert "digest" in digest_finding.message.lower()
+
+
+def test_audit_image_reports_secret_variables_without_exposing_values() -> None:
+    docker_runner = Mock(
+        return_value=subprocess.CompletedProcess(
+            args=["docker", "image", "inspect", "alpine"],
+            returncode=0,
+            stdout='[{"Config": {"User": "app", "Env": ["PASSWORD=abc123", "API_KEY=secret", "EMPTY=", "PASSWORD=abc123", "OTHER=ok"]}}]',
+            stderr="",
+        )
+    )
+    trivy_runner = Mock(
+        return_value=subprocess.CompletedProcess(
+            args=["trivy", "image", "--scanners", "vuln", "alpine"],
+            returncode=0,
+            stdout='{"Results": []}',
+            stderr="",
+        )
+    )
+
+    result = audit_image("alpine", docker_runner=docker_runner, trivy_runner=trivy_runner)
+
+    secret_finding = next(finding for finding in result.findings if finding.check == "secrets")
+    assert secret_finding.status == "HIGH"
+    assert "API_KEY" in secret_finding.message
+    assert "PASSWORD" in secret_finding.message
+    assert "abc123" not in secret_finding.message
+    assert "secret" not in secret_finding.message
+    assert secret_finding.message.count("PASSWORD") == 1
+
+
+def test_audit_image_does_not_flag_generic_gpg_key() -> None:
+    docker_runner = Mock(
+        return_value=subprocess.CompletedProcess(
+            args=["docker", "image", "inspect", "alpine"],
+            returncode=0,
+            stdout='[{"Config": {"User": "app", "Env": ["GPG_KEY=abc123", "OTHER=ok"]}}]',
+            stderr="",
+        )
+    )
+    trivy_runner = Mock(
+        return_value=subprocess.CompletedProcess(
+            args=["trivy", "image", "--scanners", "vuln", "alpine"],
+            returncode=0,
+            stdout='{"Results": []}',
+            stderr="",
+        )
+    )
+
+    result = audit_image("alpine", docker_runner=docker_runner, trivy_runner=trivy_runner)
+
+    secret_finding = next(finding for finding in result.findings if finding.check == "secrets")
+    assert secret_finding.status == "PASS"
+    assert "No suspicious environment variables detected." in secret_finding.message
+    assert "GPG_KEY" not in secret_finding.message
+    assert "abc123" not in secret_finding.message
 
 
 def test_main_audit_command_prints_result(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
