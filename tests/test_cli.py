@@ -35,7 +35,7 @@ def test_audit_image_reports_high_risk_for_root_user() -> None:
     result = audit_image("alpine", docker_runner=runner)
 
     assert result.status == "HIGH"
-    assert "root" in result.message.lower()
+    assert any(finding.check == "user" and finding.status == "HIGH" for finding in result.findings)
 
 
 def test_audit_image_reports_pass_for_non_root_user() -> None:
@@ -50,8 +50,42 @@ def test_audit_image_reports_pass_for_non_root_user() -> None:
 
     result = audit_image("alpine", docker_runner=runner)
 
-    assert result.status == "PASS"
-    assert "app" in result.message
+    assert result.status == "MEDIUM"
+    assert any(finding.check == "user" and finding.status == "PASS" for finding in result.findings)
+    assert any(finding.check == "healthcheck" and finding.status == "MEDIUM" for finding in result.findings)
+
+
+def test_audit_image_reports_exposed_ports_and_healthcheck() -> None:
+    runner = Mock(
+        return_value=subprocess.CompletedProcess(
+            args=["docker", "image", "inspect", "alpine"],
+            returncode=0,
+            stdout='[{"Config": {"User": "app", "ExposedPorts": {"80/tcp": {}}, "Healthcheck": {"Test": ["CMD", "echo", "ok"]}}}]',
+            stderr="",
+        )
+    )
+
+    result = audit_image("alpine", docker_runner=runner)
+
+    assert result.status == "INFO"
+    assert any(finding.check == "ports" and "80/tcp" in finding.message for finding in result.findings)
+    assert any(finding.check == "healthcheck" and finding.status == "PASS" for finding in result.findings)
+
+
+def test_audit_image_reports_medium_for_missing_or_disabled_healthcheck() -> None:
+    runner = Mock(
+        return_value=subprocess.CompletedProcess(
+            args=["docker", "image", "inspect", "alpine"],
+            returncode=0,
+            stdout='[{"Config": {"User": "app", "Healthcheck": {"Test": ["NONE"]}}}]',
+            stderr="",
+        )
+    )
+
+    result = audit_image("alpine", docker_runner=runner)
+
+    assert result.status == "MEDIUM"
+    assert any(finding.check == "healthcheck" and finding.status == "MEDIUM" for finding in result.findings)
 
 
 def test_audit_image_raises_for_missing_image() -> None:
@@ -76,7 +110,11 @@ def test_audit_image_raises_for_unavailable_docker() -> None:
 
 def test_main_audit_command_prints_result(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     def fake_audit_image(image_name: str, docker_runner=None) -> AuditResult:
-        return AuditResult(status="PASS", message=f"User '{image_name}' is configured")
+        return AuditResult(
+            findings=(
+                type("Finding", (), {"check": "user", "status": "PASS", "message": f"User '{image_name}' is configured"})(),
+            )
+        )
 
     monkeypatch.setattr("docker_security_auditor.cli.audit_image", fake_audit_image)
 
