@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 SUSPICIOUS_ENV_VAR_NAMES = {
@@ -43,6 +45,10 @@ class TrivyInvalidJsonError(RuntimeError):
     """Raised when Trivy returns invalid JSON output."""
 
 
+class ReportWriteError(RuntimeError):
+    """Raised when a JSON report cannot be written to disk."""
+
+
 @dataclass(frozen=True)
 class AuditFinding:
     """Represents a single audit finding."""
@@ -57,6 +63,8 @@ class AuditResult:
     """Represents the outcome of auditing an image."""
 
     findings: tuple[AuditFinding, ...]
+    high_vulnerability_count: int = 0
+    critical_vulnerability_count: int = 0
 
     @property
     def status(self) -> str:
@@ -74,7 +82,19 @@ class AuditResult:
     @property
     def message(self) -> str:
         """Return a single summary line for the result."""
-        return " | ".join(f"{finding.check}: {finding.message}" for finding in self.findings)
+        return " | ".join(
+            f"{finding.check}: {_sanitize_report_value(finding.message)}"
+            for finding in self.findings
+        )
+
+    @property
+    def risk_score(self) -> int:
+        """Return the calculated risk score for this result."""
+        return calculate_risk_score(
+            self.findings,
+            high_count=self.high_vulnerability_count,
+            critical_count=self.critical_vulnerability_count,
+        )
 
 
 def _default_docker_runner(image_name: str) -> subprocess.CompletedProcess[str]:
@@ -85,6 +105,74 @@ def _default_docker_runner(image_name: str) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
     )
+
+
+def calculate_risk_score(findings: object, high_count: int = 0, critical_count: int = 0) -> int:
+    """Calculate a deterministic risk score from 0 to 100."""
+    score = 0
+
+    for finding in findings:
+        if not isinstance(finding, AuditFinding):
+            continue
+        if finding.check == "tag" and finding.status == "MEDIUM" and "latest" in finding.message.lower():
+            score += 10
+        elif finding.check == "user" and finding.status == "HIGH" and "root-equivalent" in finding.message.lower():
+            score += 25
+        elif finding.check == "healthcheck" and finding.status == "MEDIUM":
+            score += 10
+        elif finding.check == "secrets" and finding.status == "HIGH":
+            score += 25
+
+    score += min(high_count, 10) * 2
+    score += min(critical_count, 4) * 10
+    return min(score, 100)
+
+
+def build_json_report(image_name: str, result: AuditResult, high_count: int = 0, critical_count: int = 0, exit_code: int = 0) -> dict[str, object]:
+    """Build a structured JSON report without including secret values."""
+    vulnerability_counts = {
+        "high": high_count if high_count else result.high_vulnerability_count,
+        "critical": critical_count if critical_count else result.critical_vulnerability_count,
+        "total": (high_count if high_count else result.high_vulnerability_count)
+        + (critical_count if critical_count else result.critical_vulnerability_count),
+    }
+
+    report = {
+        "schema_version": 1,
+        "image": image_name,
+        "overall_severity": result.status,
+        "risk_score": calculate_risk_score(result.findings, high_count=vulnerability_counts["high"], critical_count=vulnerability_counts["critical"]),
+        "exit_code": exit_code,
+        "vulnerability_counts": vulnerability_counts,
+        "results": [
+            {
+                "check": finding.check,
+                "status": finding.status,
+                "message": _sanitize_report_value(finding.message),
+            }
+            for finding in result.findings
+        ],
+    }
+    return report
+
+
+def write_json_report(payload: dict[str, object], destination: str | Path) -> None:
+    """Write a human-readable JSON report to disk, creating parent directories if needed."""
+    path = Path(destination)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise ReportWriteError(f"Failed to write JSON report to '{path}'.") from exc
+
+
+def _sanitize_report_value(value: str) -> str:
+    """Remove secret-like values from report content when present."""
+    if not isinstance(value, str):
+        return ""
+
+    redacted = re.sub(r"(?i)([A-Za-z_][A-Za-z0-9_\-]*=)([^\s,;]+)", r"\1[REDACTED]", value)
+    return redacted
 
 
 def _default_trivy_runner(image_name: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
@@ -319,4 +407,8 @@ def audit_image(
         )
     )
 
-    return AuditResult(findings=tuple(findings))
+    return AuditResult(
+        findings=tuple(findings),
+        high_vulnerability_count=high_count,
+        critical_vulnerability_count=critical_count,
+    )
