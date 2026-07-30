@@ -1,20 +1,28 @@
 from __future__ import annotations
 
+import json
 import subprocess
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
+from docker_security_auditor import cli as cli_module
 from docker_security_auditor.auditor import (
+    AuditFinding,
     AuditResult,
     DockerUnavailableError,
     ImageNotFoundError,
+    ReportWriteError,
     TrivyInvalidJsonError,
     TrivyScanError,
     TrivyTimeoutError,
     TrivyUnavailableError,
     audit_image,
+    build_json_report,
+    calculate_risk_score,
     scan_image_vulnerabilities,
+    write_json_report,
 )
 from docker_security_auditor.cli import build_parser, main
 
@@ -397,6 +405,138 @@ def test_audit_image_reports_secret_variables_without_exposing_values() -> None:
     assert "abc123" not in secret_finding.message
     assert "secret" not in secret_finding.message
     assert secret_finding.message.count("PASSWORD") == 1
+
+
+def test_calculate_risk_score_uses_expected_components_and_caps_at_hundred() -> None:
+    findings = (
+        AuditFinding(check="tag", status="MEDIUM", message="Uses the mutable 'latest' tag implicitly."),
+        AuditFinding(check="user", status="HIGH", message="Configured user is 'root' (root-equivalent)."),
+        AuditFinding(check="healthcheck", status="MEDIUM", message="No health check is configured."),
+        AuditFinding(check="secrets", status="HIGH", message="Suspicious environment variables: API_KEY, PASSWORD."),
+    )
+
+    score = calculate_risk_score(findings, high_count=25, critical_count=25)
+
+    assert score == 100
+
+
+def test_calculate_risk_score_for_moderate_findings() -> None:
+    findings = (
+        AuditFinding(check="tag", status="MEDIUM", message="Uses the mutable 'latest' tag."),
+        AuditFinding(check="healthcheck", status="PASS", message="A health check is configured."),
+    )
+
+    score = calculate_risk_score(findings, high_count=3, critical_count=1)
+
+    assert score == 10 + 6 + 10
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_exit_code"),
+    [
+        ("PASS", 0),
+        ("INFO", 0),
+        ("MEDIUM", 1),
+        ("HIGH", 2),
+        ("CRITICAL", 3),
+    ],
+)
+def test_main_returns_expected_exit_code_for_severity(status: str, expected_exit_code: int, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(cli_module, "audit_image", lambda image_name: AuditResult(findings=(AuditFinding("tag", status, "message"),)))
+
+    exit_code = main(["audit", "alpine"])
+
+    captured = capsys.readouterr()
+    assert exit_code == expected_exit_code
+    assert status in captured.out
+
+
+def test_main_returns_operational_error_exit_code(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(cli_module, "audit_image", lambda image_name: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    exit_code = main(["audit", "alpine"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 4
+    assert "boom" in captured.err
+
+
+def test_build_json_report_contains_expected_fields_and_no_secret_values() -> None:
+    result = AuditResult(
+        findings=(
+            AuditFinding(check="tag", status="MEDIUM", message="Uses the mutable 'latest' tag implicitly."),
+            AuditFinding(check="user", status="HIGH", message="Configured user is 'root' (root-equivalent)."),
+            AuditFinding(check="healthcheck", status="MEDIUM", message="No health check is configured."),
+            AuditFinding(check="secrets", status="HIGH", message="Suspicious environment variables: API_KEY, PASSWORD."),
+            AuditFinding(check="vulnerabilities", status="CRITICAL", message="HIGH=2 CRITICAL=1 total=3"),
+        )
+    )
+
+    report = build_json_report("alpine", result, high_count=2, critical_count=1, exit_code=3)
+
+    assert report["schema_version"] == 1
+    assert report["image"] == "alpine"
+    assert report["overall_severity"] == "CRITICAL"
+    assert report["risk_score"] == 84
+    assert report["exit_code"] == 3
+    assert report["vulnerability_counts"] == {"high": 2, "critical": 1, "total": 3}
+    assert report["results"][0]["check"] == "tag"
+    assert report["results"][-1]["check"] == "vulnerabilities"
+    payload = json.dumps(report)
+    assert "abc123" not in payload
+    assert "API_KEY=secret" not in payload
+    assert "PASSWORD=abc123" not in payload
+
+
+def test_write_json_report_creates_parent_directories(tmp_path: Path) -> None:
+    destination = tmp_path / "nested" / "reports" / "audit.json"
+    payload = {"schema_version": 1, "image": "alpine"}
+
+    write_json_report(payload, destination)
+
+    assert destination.exists()
+    written = json.loads(destination.read_text(encoding="utf-8"))
+    assert written["image"] == "alpine"
+
+
+def test_write_json_report_raises_for_write_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    destination = tmp_path / "audit.json"
+    payload = {"schema_version": 1, "image": "alpine"}
+
+    def fail_write_text(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", fail_write_text)
+
+    with pytest.raises(ReportWriteError):
+        write_json_report(payload, destination)
+
+
+def test_main_does_not_write_report_unless_requested(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    report_path = tmp_path / "report.json"
+    monkeypatch.setattr(cli_module, "audit_image", lambda image_name: AuditResult(findings=(AuditFinding("tag", "PASS", "message"),)))
+
+    exit_code = main(["audit", "alpine"])
+
+    assert exit_code == 0
+    assert not report_path.exists()
+
+
+def test_main_redacts_secret_values_from_terminal_output(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "audit_image",
+        lambda image_name: AuditResult(
+            findings=(AuditFinding("secrets", "HIGH", "Suspicious environment variables: PASSWORD=abc123"),)
+        ),
+    )
+
+    main(["audit", "alpine"])
+
+    captured = capsys.readouterr()
+    assert "abc123" not in captured.out
+    assert "PASSWORD=abc123" not in captured.out
+    assert "API_KEY=secret" not in captured.out
 
 
 def test_audit_image_does_not_flag_generic_gpg_key() -> None:

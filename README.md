@@ -52,18 +52,80 @@ It parses the JSON payload, counts HIGH and CRITICAL findings across all results
 - `HIGH` when only HIGH findings are present
 - `CRITICAL` when at least one CRITICAL finding is present
 
-### Example output
+### Risk scoring
 
-High-risk root image:
+The audit calculates a deterministic score from 0 to 100 based on the checks below:
 
-```text
-HIGH: tag: Uses the mutable 'latest' tag implicitly. | user: Configured user is 'root' (root-equivalent). | ports: No exposed ports are declared. | healthcheck: No health check is configured. | secrets: PASS: No suspicious environment variables detected. | vulnerabilities: HIGH=2 CRITICAL=0 total=2
+- mutable latest/implicit-latest tag: +10
+- root-equivalent configured user: +25
+- missing or disabled health check: +10
+- one or more secret-like environment variables: +25 total
+- HIGH vulnerabilities: +2 each, capped at +20
+- CRITICAL vulnerabilities: +10 each, capped at +40
+- declared exposed ports: +0
+
+The final score is capped at 100. The terminal summary prints the score as `risk_score=<value>`, while the overall severity remains based on the highest-severity finding.
+
+### Exit codes
+
+| Severity | Exit code |
+| --- | ---: |
+| PASS / INFO | 0 |
+| MEDIUM | 1 |
+| HIGH | 2 |
+| CRITICAL | 3 |
+| Operational error (Docker/Trivy failure, invalid JSON, timeout, report write failure) | 4 |
+
+The CLI still prints the complete audit result before exiting.
+
+### JSON report export
+
+Use the optional `--json-report` argument to write a structured report alongside the normal concise terminal output:
+
+```bash
+python -m docker_security_auditor audit alpine --json-report reports/alpine.json
 ```
 
-Critical image with a vulnerable package:
+The JSON report includes:
+
+- `schema_version`
+- `image`
+- `overall_severity`
+- `risk_score`
+- `exit_code`
+- `vulnerability_counts`
+- `results` for each check
+
+The payload never includes environment-variable values or other secret values.
+
+Example JSON report excerpt:
+
+```json
+{
+  "schema_version": 1,
+  "image": "alpine",
+  "overall_severity": "CRITICAL",
+  "risk_score": 84,
+  "exit_code": 3,
+  "vulnerability_counts": {
+    "high": 2,
+    "critical": 1,
+    "total": 3
+  },
+  "results": [
+    {
+      "check": "tag",
+      "status": "MEDIUM",
+      "message": "Uses the mutable 'latest' tag implicitly."
+    }
+  ]
+}
+```
+
+### Safe example output
 
 ```text
-CRITICAL: tag: Uses explicit tag '1.2.3'. | user: Configured user is 'app'. | ports: Exposed ports: 80/tcp. | healthcheck: A health check is configured. | secrets: HIGH: Suspicious environment variables: API_KEY, PASSWORD. | vulnerabilities: HIGH=1 CRITICAL=1 total=2
+HIGH: tag: Uses the mutable 'latest' tag implicitly. | user: Configured user is 'root' (root-equivalent). | ports: No exposed ports are declared. | healthcheck: No health check is configured. | secrets: HIGH: Suspicious environment variables: API_KEY, PASSWORD. | vulnerabilities: HIGH=2 CRITICAL=0 total=2 | risk_score=60
 ```
 
 ## Next steps
